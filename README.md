@@ -1,95 +1,107 @@
-# DupDub Stellar Contracts
+# dabdub_contracts
 
-> Soroban smart contracts powering the DupDub crypto-to-fiat settlement platform on Stellar.
+Soroban smart contracts powering the dabdub payment platform.
 
-## Overview
+## Contract Interaction Diagrams
 
-This repository contains the Soroban (Stellar smart contract platform) contracts that back DupDub's on-chain settlement flow — payment escrow, merchant registry, fee handling, and related infrastructure. It does **not** contain the backend API or frontend application; those live in their own repositories:
+> **Maintenance note:** These diagrams are part of the contract documentation. Whenever a new cross-contract call is added (a new `#[contractclient]` interface, a new `env.invoke_contract` / client invocation, or a new contract-to-contract data dependency), update the relevant diagram below in the same PR. Reviewers should treat a stale diagram as a documentation bug.
 
-- **Backend (Settlement API)** — `dupdap-backend`
-- **Frontend (Merchant & Customer Portal)** — `dupdap-frontend`
+### Contract Call Graph
 
-API work tracked in this repository is implemented in the backend; see [the backend API implementation note](docs/backend-api-implementation.md).
+Shows which contracts invoke which other contracts. Arrows point from caller to callee.
 
-## Contracts
+```mermaid
+flowchart TD
+    subgraph Core["Core Payment Flow"]
+        PE[payment_escrow]
+        SL[settlement_ledger]
+        MR[merchant_registry]
+        RF[refund_manager]
+    end
 
-All contracts live under [`dupdapp_contract/contracts/`](dupdapp_contract/contracts/):
+    subgraph Support["Supporting Contracts"]
+        FE[fee_manager]
+        TR[treasury]
+        OR[oracle_router]
+        DS[dispute_resolver]
+        NT[notification_hub]
+        AC[access_control]
+        UP[upgrade_governor]
+        AN[analytics]
+        KY[kyc_registry]
+        MT[multisig_treasury]
+    end
 
-| Contract | Purpose |
-|---|---|
-| `admin_timelock` | Timelocked admin actions |
-| `batch_payments` | Batched payment processing |
-| `fee_calculator` | Fee computation logic |
-| `fee_distributor` | Fee distribution to recipients |
-| `liquidity_router` | Liquidity routing for settlements |
-| `merchant_registry` | Merchant registration and metadata |
-| `multisig_admin` | Multi-signature admin control |
-| `payment_escrow` | Escrow for customer payments (approve → deposit → settle) |
-| `payment_request` | Payment request lifecycle |
-| `rbac_access` | Role-based access control |
-| `reconciliation` | Settlement reconciliation |
-| `settlement_ledger` | On-chain settlement record-keeping |
-| `slippage_protection` | Slippage guards for conversions |
-| `stellar_confirmations` | Confirmation tracking for Stellar transactions |
+    PE -->|is_approved| MR
+    PE -->|record_settlement| SL
+    PE -->|transfer| TR
+    PE -->|compute_fee| FE
+    PE -->|resolve| DS
+    PE -->|emit| NT
+    PE -->|check_role| AC
 
-## Development
+    SL -->|compute_fee| FE
+    SL -->|transfer| TR
+    SL -->|emit| NT
+    SL -->|record| AN
 
-### Prerequisites
+    RF -->|transfer| TR
+    RF -->|emit| NT
+    RF -->|check_role| AC
 
-- Rust with the `wasm32v1-none` target
-- [`stellar-cli`](https://developers.stellar.org/docs/tools/developer-tools) (for deployment)
-- `wasm-opt` (binaryen), for optimised release builds
+    DS -->|check_role| AC
+    DS -->|transfer| TR
+    DS -->|emit| NT
 
-```bash
-rustup target add wasm32v1-none
+    OR -->|get_price| AN
+    OR -->|check_role| AC
+
+    FE -->|check_role| AC
+    TR -->|check_role| AC
+    TR -->|check_role| MT
+
+    NT -->|check_role| AC
+    AN -->|check_role| AC
+    KY -->|check_role| AC
+    MT -->|check_role| AC
+
+    UP -->|check_role| AC
+    UP -->|update_wasm| PE
+    UP -->|update_wasm| SL
+    UP -->|update_wasm| RF
 ```
 
-### Build & test
+### Payment Escrow Deposit → Settlement Ledger Record (Data Flow)
 
-```bash
-make build              # debug build of all contracts
-make build-optimised    # release build + wasm-opt -Oz
-make check-wasm-size    # enforce the 64 KB per-contract WASM limit
-make test               # cargo test across the workspace
+Shows the data flow when a customer deposits into `payment_escrow` and the escrow later records the settlement in `settlement_ledger`.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Customer
+    participant PE as payment_escrow
+    participant MR as merchant_registry
+    participant TK as Token (XLM/USDC)
+    participant SL as settlement_ledger
+    participant FE as fee_manager
+    participant TR as treasury
+
+    Customer->>PE: deposit(payment_id, merchant, amount, expiry)
+    PE->>MR: is_approved(merchant)
+    MR-->>PE: true
+    PE->>TK: transfer(customer, escrow, amount)
+    TK-->>PE: ok
+    PE->>PE: store Payment{status: Pending}
+    PE-->>Customer: DepositEvent
+
+    Note over Customer,PE: ... payment released or dispute resolved ...
+
+    PE->>SL: record_settlement(payment_id, merchant, amount)
+    SL->>FE: compute_fee(amount)
+    FE-->>SL: fee
+    SL->>TR: transfer(fee)
+    SL->>TR: transfer(amount - fee)
+    SL->>SL: store SettlementRecord{payment_id, merchant, amount, fee}
+    SL-->>PE: SettlementRecordedEvent
+    PE->>PE: Payment{status: Released}
 ```
-
-Or directly with cargo, from `dupdapp_contract/`:
-
-```bash
-cd dupdapp_contract
-cargo build --target wasm32v1-none --release
-cargo test
-```
-
-## CI/CD
-
-- **CI** ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — runs `cargo test`, coverage (tarpaulin), and a WASM build on every push/PR.
-- **Deploy** ([`.github/workflows/deploy.yml`](.github/workflows/deploy.yml)) — builds and optimises WASMs, then deploys to Stellar testnet on merges to `main` and to mainnet on version tags (manual approval required).
-
-## Monitoring
-
-Grafana/Loki/Promtail configs under [`grafana/`](grafana/) and [`docker-compose.yml`](docker-compose.yml) are provided for local observability tooling; see [`monitoring/`](monitoring/) for uptime/status-page setup.
-
-## Docs
-
-- [Escrow upgrade procedure](docs/escrow_upgrade_procedure.md)
-- [Security docs](docs/security/)
-
-## Links
-
-- **Website**: [https://dupdub.xyz](https://dupdub.xyz)
-- **Documentation**: [https://docs.dupdub.xyz](https://docs.dupdub.xyz)
-
-## Handsoff notes
-
-<!-- handsoff-issue-1094 -->
-- #1094: merchant_registry and payment_escrow: a merchant suspended after deposit is still paid out by release/release_partial
-
-<!-- handsoff-issue-1107 -->
-- #1107: payment_escrow::dispute's _reason parameter is misleadingly underscore-prefixed despite being used, and has no validation
-
-<!-- handsoff-issue-1108 -->
-- #1108: payment_escrow: dispute resolution is all-or-nothing on the remainder even after a merchant has already delivered via partial release
-
-<!-- handsoff-issue-1113 -->
-- #1113: payment_escrow: the highest-risk functions (upgrade, emergency_drain's XLM path, set_registry(None)) have the thinnest test coverage
