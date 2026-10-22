@@ -5,6 +5,10 @@ on:
     - cron: '0 8 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  issues: write
+
 jobs:
   dependency-audit-report:
     runs-on: ubuntu-latest
@@ -34,6 +38,74 @@ jobs:
           echo "" >> audit-report.txt
           echo "## Frontend" >> audit-report.txt
           cat frontend-audit-report.txt >> audit-report.txt
+
+      - name: Detect vulnerabilities
+        id: detect
+        run: |
+          if grep -Eiq 'vulnerabilit|CVE-[0-9]{4}-[0-9]+|GHSA-[a-z0-9-]+' audit-report.txt; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build issue body with CVE links
+        if: steps.detect.outputs.found == 'true'
+        run: |
+          {
+            echo "The weekly dependency audit detected vulnerabilities. See the full report below."
+            echo ""
+            echo "_Generated on $(date -u +'%Y-%m-%d %H:%M UTC') by the weekly-dependency-audit-report workflow._"
+            echo ""
+            echo '```'
+            cat audit-report.txt
+            echo '```'
+            echo ""
+            echo "### Advisory / CVE links"
+            grep -Eio 'CVE-[0-9]{4}-[0-9]+|GHSA-[a-z0-9-]+' audit-report.txt | sort -u | while read -r id; do
+              case "$id" in
+                CVE-*) echo "- [$id](https://nvd.nist.gov/vuln/detail/$id)" ;;
+                GHSA-*) echo "- [$id](https://github.com/advisories/$id)" ;;
+              esac
+            done
+          } > issue-body.md
+
+      - name: Create or update security issue
+        if: steps.detect.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Weekly Dependency Audit: vulnerabilities detected"
+          EXISTING=$(gh issue list --label security --state open --search "$TITLE in:title" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --body-file issue-body.md
+          else
+            gh issue create --title "$TITLE" --label security --body-file issue-body.md
+          fi
+
+      - name: Auto-close security issue when audit passes
+        if: steps.detect.outputs.found == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="Weekly Dependency Audit: vulnerabilities detected"
+          EXISTING=$(gh issue list --label security --state open --search "$TITLE in:title" --json number --jq '.[0].number')
+          if [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --comment "Dependencies have been updated and the latest weekly audit passed with no vulnerabilities. Closing automatically."
+          fi
+
+      - name: Post results to Slack
+        if: always() && secrets.SLACK_SECURITY_WEBHOOK_URL != ''
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_SECURITY_WEBHOOK_URL }}
+          FOUND: ${{ steps.detect.outputs.found }}
+        run: |
+          if [ "$FOUND" = "true" ]; then
+            STATUS="Vulnerabilities detected — see the security issue in GitHub."
+          else
+            STATUS="No vulnerabilities detected."
+          fi
+          PAYLOAD=$(jq -n --arg text "Weekly Dependency Audit: $STATUS" '{text: $text}')
+          curl -fsS -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$SLACK_WEBHOOK_URL"
 
       - name: Send audit report to admin
         uses: dawidd6/action-send-mail@v3
