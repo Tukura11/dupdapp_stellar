@@ -20,6 +20,12 @@
 // Then reference it as STATUS_HTML below.
 // If you prefer, replace with a fetch to your CDN.
 
+// ─── Soroban-specific health check thresholds ────────────────────────────────
+const SOROBAN_RPC_TIMEOUT_MS = 5000;   // RPC probe budget
+const SOROBAN_RPC_DEGRADED_MS = 1500;  // response time above this → degraded
+const EVENT_INDEXER_MAX_LAG_MS = 30_000; // last payment_escrow event must be < 30s old
+const FEE_TEST_MERCHANT = 'test-merchant'; // merchant used for fee_calculator probe
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -27,6 +33,11 @@ export default {
     // ── Proxy: /api/status → upstream /health/admin ──────────────────────────
     if (url.pathname === '/api/status') {
       return proxyHealthAdmin(env);
+    }
+
+    // ── Soroban-specific health checks ───────────────────────────────────────
+    if (url.pathname === '/api/status/soroban') {
+      return sorobanStatus(env);
     }
 
     // ── Status page HTML ──────────────────────────────────────────────────────
@@ -86,6 +97,152 @@ async function proxyHealthAdmin(env) {
     // halves upstream load while keeping data fresh enough.
     'Cache-Control': 'public, max-age=30, s-maxage=30',
   });
+}
+
+// ─── Soroban-specific health checks ───────────────────────────────────────────
+// Runs three probes in parallel and aggregates them into a single status body
+// that mirrors the shape of /health/admin so the status page can render it.
+async function sorobanStatus(env) {
+  const apiOrigin = env.API_ORIGIN ?? 'https://api.cheesepay.xyz';
+  const rpcUrl = env.SOROBAN_RPC_URL ?? 'https://soroban-testnet.stellar.org';
+
+  const [rpc, indexer, fee] = await Promise.all([
+    checkSorobanRpc(rpcUrl),
+    checkEventIndexer(apiOrigin),
+    checkFeeCalculator(apiOrigin),
+  ]);
+
+  const components = {
+    sorobanRpc: rpc,
+    eventIndexer: indexer,
+    feeCalculator: fee,
+  };
+
+  const anyDown = Object.values(components).some((c) => c.status === 'down');
+  const anyDegraded = Object.values(components).some((c) => c.status === 'degraded');
+  const status = anyDown ? 'down' : anyDegraded ? 'degraded' : 'up';
+
+  return jsonResponse(
+    { status, timestamp: new Date().toISOString(), components },
+    anyDown ? 503 : 200,
+    { 'Cache-Control': 'public, max-age=30, s-maxage=30' },
+  );
+}
+
+// Check 1: Soroban RPC endpoint response time.
+async function checkSorobanRpc(rpcUrl) {
+  const started = Date.now();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SOROBAN_RPC_TIMEOUT_MS);
+
+  try {
+    const res = await fetch(rpcUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'getHealth' }),
+      signal: controller.signal,
+    });
+    const latency = Date.now() - started;
+
+    if (!res.ok) {
+      return { status: 'down', latency, error: `HTTP ${res.status}` };
+    }
+
+    let body;
+    try {
+      body = await res.json();
+    } catch {
+      return { status: 'down', latency, error: 'Invalid RPC response' };
+    }
+
+    if (body?.error) {
+      return { status: 'down', latency, error: body.error.message ?? 'RPC error' };
+    }
+
+    const health = body?.result?.status;
+    if (health && health !== 'healthy') {
+      return { status: 'degraded', latency, error: `RPC status: ${health}` };
+    }
+
+    return {
+      status: latency > SOROBAN_RPC_DEGRADED_MS ? 'degraded' : 'up',
+      latency,
+    };
+  } catch (err) {
+    return {
+      status: 'down',
+      latency: Date.now() - started,
+      error: err?.name === 'AbortError' ? 'RPC timeout' : 'RPC unreachable',
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Check 2: last payment_escrow event indexed within 30s.
+async function checkEventIndexer(apiOrigin) {
+  const started = Date.now();
+  try {
+    const res = await fetch(`${apiOrigin}/health/indexer`, {
+      headers: { Accept: 'application/json' },
+    });
+    const latency = Date.now() - started;
+
+    if (!res.ok) {
+      return { status: 'down', latency, error: `HTTP ${res.status}` };
+    }
+
+    const body = await res.json();
+    const lastEventAt = body?.lastEventAt ?? body?.lastPaymentEscrowEventAt;
+    if (!lastEventAt) {
+      return { status: 'down', latency, error: 'No payment_escrow event indexed' };
+    }
+
+    const lagMs = Date.now() - new Date(lastEventAt).getTime();
+    if (!Number.isFinite(lagMs)) {
+      return { status: 'down', latency, error: 'Invalid lastEventAt' };
+    }
+
+    return {
+      status: lagMs > EVENT_INDEXER_MAX_LAG_MS ? 'down' : 'up',
+      latency,
+      lagMs,
+      lastEventAt,
+      ...(lagMs > EVENT_INDEXER_MAX_LAG_MS
+        ? { error: `Indexer lag ${Math.round(lagMs / 1000)}s exceeds 30s` }
+        : {}),
+    };
+  } catch {
+    return { status: 'down', latency: Date.now() - started, error: 'Indexer unreachable' };
+  }
+}
+
+// Check 3: fee_calculator returns a valid fee for a test merchant.
+async function checkFeeCalculator(apiOrigin) {
+  const started = Date.now();
+  try {
+    const res = await fetch(
+      `${apiOrigin}/fees/calculate?merchant=${encodeURIComponent(FEE_TEST_MERCHANT)}`,
+      { headers: { Accept: 'application/json' } },
+    );
+    const latency = Date.now() - started;
+
+    if (!res.ok) {
+      return { status: 'down', latency, error: `HTTP ${res.status}` };
+    }
+
+    const body = await res.json();
+    const fee = body?.fee ?? body?.feeAmount ?? body?.amount;
+    const feeNum = typeof fee === 'string' ? Number(fee) : fee;
+
+    if (typeof feeNum !== 'number' || !Number.isFinite(feeNum) || feeNum < 0) {
+      return { status: 'down', latency, error: 'Invalid fee returned' };
+    }
+
+    return { status: 'up', latency, fee: feeNum };
+  } catch {
+    return { status: 'down', latency: Date.now() - started, error: 'Fee calculator unreachable' };
+  }
 }
 
 // ─── Serve status page HTML ───────────────────────────────────────────────────
